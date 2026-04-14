@@ -16,238 +16,14 @@
 - 支持恢复 DynamicV6 变更
 - 支持一键卸载
 
----
-
-## 支持的地区代号
-
-脚本支持以下地区代号识别：
-
-- `tw`：台湾
-- `my`：马来西亚
-- `vn`：越南
-- `jp`：日本
-- `hk`：香港
-- `sg`：新加坡
-- `us`：美国
-
-如果同一地区有多条线路，脚本会生成类似下面的线路代号：
-
-- `jp-1`
-- `jp-2`
-- `hk-1`
-
----
-
-## 运行要求
-
-- Linux VPS
-- `root` 权限
-- 系统中已安装以下命令：
-  - `bash`
-  - `curl`
-  - `jq`
-  - `ip`
-
-> 本项目是服务端 Shell 脚本，需在 VPS / Linux 环境中运行，不是在 Windows 本机直接执行。
-
----
-
 ## 安装方法
 
-将脚本上传到服务器后执行：
+一键安装
 
-```bash
-chmod +x v6.sh
-sudo bash v6.sh
+```
+wget -O install.sh https://raw.githubusercontent.com/endview/aether-v6-switch/main/v6.sh && chmod +x install.sh && sudo bash install.sh
 ```
 
-安装完成后，脚本会生成快捷命令：
-
-```bash
-qh
-```
-
----
-
-## 首次安装流程
-
-运行安装脚本后，通常会经历以下步骤：
-
-1. 识别当前网卡
-2. 记录当前原生 IPv6 默认路由
-3. 下载并执行 DynamicV6 分发脚本
-4. 从网卡读取可用的 DynamicV6 `/128` 地址
-5. 获取地区与网关映射
-6. 生成 `qh` 管理命令
-7. 可选开启自动巡检与自动切换
-
-安装结束后，你可以选择立即切换到某条线路，或者保持原生 IPv6。
-
----
-
-## 常用命令
-
-### 查看帮助
-
-```bash
-qh --help
-```
-
-### 进入交互菜单
-
-```bash
-qh
-```
-
-### 查看全部线路
-
-```bash
-qh list
-```
-
-### 查看当前状态
-
-```bash
-qh status
-```
-
-### 切回原生 IPv6
-
-```bash
-qh native
-```
-
-### 切换到某条 DynamicV6 线路
-
-```bash
-qh jp-1
-qh hk-1
-qh us-1
-```
-
-### 按序号切换
-
-```bash
-qh 1
-qh 2
-```
-
-### 按地区切换
-
-```bash
-qh jp
-qh jp 2
-```
-
----
-
-## 连通性检测
-
-### 检测当前线路
-
-```bash
-qh test
-```
-
-### 检测全部线路
-
-```bash
-qh probe
-```
-
-### 检测指定线路
-
-```bash
-qh probe jp-1
-```
-
-脚本会使用 **IPv6 连通性探测** 判断线路是否可用。
-
----
-
-## 优先级管理
-
-可以为不同线路设置切换优先级，数字越小优先级越高。
-
-### 查看优先级
-
-```bash
-qh priority list
-```
-
-### 设置优先级
-
-```bash
-qh priority set jp-1 1
-qh priority set hk-1 2
-```
-
-### 使用字母向导调整优先级
-
-```bash
-qh priority wizard
-```
-
----
-
-## 自动切换 / 自动巡检
-
-脚本支持定时巡检 IPv6 连通性，并自动切换到优先级最高且可用的线路。
-
-### 手动执行一次自动切换
-
-```bash
-qh auto
-```
-
-### 开启自动守护
-
-```bash
-qh auto on
-```
-
-### 关闭自动守护
-
-```bash
-qh auto off
-```
-
-### 查看自动守护状态
-
-```bash
-qh auto status
-```
-
-默认巡检间隔为 **2 分钟**。  
-系统支持时优先使用 `systemd timer`，否则回退到 `cron`。
-
----
-
-## 恢复与卸载
-
-### 恢复 DynamicV6 变更
-
-```bash
-qh restore
-```
-
-### 卸载并清理
-
-```bash
-qh uninstall
-```
-
----
-
-## 文件与目录说明
-
-安装后会涉及以下路径：
-
-- 命令入口：`/usr/local/bin/qh`
-- 配置目录：`/etc/qh`
-- 状态目录：`/var/lib/qh`
-
----
 
 ## 注意事项
 
@@ -259,17 +35,15 @@ qh uninstall
 
 ---
 
-## 项目用途
+## FAQ
+>  Q：干嘛的
 
-这个项目适合以下场景：
+- A：不知道
+>  Q：怎么写得这么臭
 
-- 需要在不同 IPv6 出口地区之间快速切换
-- 需要保留原生 IPv6 并随时回切
-- 需要自动故障转移
-- 需要长期稳定巡检 IPv6 可用性
+- A：不知道，我不会写，ai干的
 
----
-
+  
 ## License
 
 本项目基于 **MIT License** 开源。
