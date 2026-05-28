@@ -467,6 +467,55 @@ normalize_ipv6() {
   echo "$out"
 }
 
+normalize_cidr_key() {
+  local cidr="$1"
+  local addr prefix normalized
+
+  [[ "$cidr" == */* ]] || return 1
+  addr="${cidr%/*}"
+  prefix="${cidr#*/}"
+  [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+
+  normalized="$(normalize_ipv6 "$addr" 2>/dev/null || true)"
+  [[ -n "$normalized" ]] || return 1
+  printf '%s/%s\n' "$normalized" "$prefix"
+}
+
+ipv6_prefix_key() {
+  local addr="$1"
+  local prefix_len="$2"
+  local -a parts=()
+  local keep i out=""
+
+  [[ "$prefix_len" =~ ^[0-9]+$ ]] || return 1
+  (( prefix_len >= 0 && prefix_len <= 128 && prefix_len % 16 == 0 )) || return 1
+
+  mapfile -t parts < <(split_ipv6_hextets "$addr") || return 1
+  (( ${#parts[@]} == 8 )) || return 1
+
+  keep=$((prefix_len / 16))
+  for ((i = 0; i < keep; i++)); do
+    out+="${parts[$i]}"
+    [[ "$i" -lt $((keep - 1)) ]] && out+=":"
+  done
+
+  echo "$out"
+}
+
+ipv6_in_prefix() {
+  local addr="$1"
+  local prefix="$2"
+  local prefix_addr prefix_len addr_key prefix_key
+
+  [[ -n "$addr" && "$prefix" == */* ]] || return 1
+  prefix_addr="${prefix%/*}"
+  prefix_len="${prefix#*/}"
+
+  addr_key="$(ipv6_prefix_key "$addr" "$prefix_len" 2>/dev/null || true)"
+  prefix_key="$(ipv6_prefix_key "$prefix_addr" "$prefix_len" 2>/dev/null || true)"
+  [[ -n "$addr_key" && -n "$prefix_key" && "$addr_key" == "$prefix_key" ]]
+}
+
 ipv6_equal() {
   local left right
 
@@ -549,6 +598,66 @@ native_gateway_guess_from_cidr() {
   printf '%s:%s:%s:%s:%s:%s:%s:%s\n' \
     "${parts[0]}" "${parts[1]}" "${parts[2]}" "${parts[3]}" \
     "${parts[4]}" "${parts[5]}" "${parts[6]}" "${parts[7]}"
+}
+
+dynamic_gateway_guess_from_prefix() {
+  local prefix="$1"
+  local addr prefix_len i
+  local -a parts=()
+
+  [[ "$prefix" == */* ]] || return 1
+  addr="${prefix%/*}"
+  prefix_len="${prefix#*/}"
+  [[ "$prefix_len" =~ ^[0-9]+$ ]] || return 1
+  (( prefix_len == 80 )) || return 1
+
+  mapfile -t parts < <(split_ipv6_hextets "$addr") || return 1
+  (( ${#parts[@]} == 8 )) || return 1
+
+  for ((i = prefix_len / 16; i < 8; i++)); do
+    parts[$i]="0"
+  done
+  parts[7]="3"
+  printf '%s:%s:%s:%s:%s:%s:%s:%s\n' \
+    "${parts[0]}" "${parts[1]}" "${parts[2]}" "${parts[3]}" \
+    "${parts[4]}" "${parts[5]}" "${parts[6]}" "${parts[7]}"
+}
+
+route_gateway_for_dynamic_cidr() {
+  local cidr="$1"
+  local prefix="${2:-}"
+  local iface="${3:-$IFACE}"
+  local probe_prefix line gw dest
+
+  [[ -n "$cidr" && -n "$iface" ]] || return 1
+  if [[ "$prefix" == */* ]]; then
+    probe_prefix="$prefix"
+  else
+    probe_prefix="${cidr%/*}/80"
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    gw="$(route_field "$line" "via")"
+    [[ -n "$gw" ]] || continue
+    if ipv6_in_prefix "$gw" "$probe_prefix"; then
+      echo "$gw"
+      return 0
+    fi
+  done < <(ip -6 route show default dev "$iface" 2>/dev/null)
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    dest="${line%% *}"
+    [[ "$dest" == */128 ]] || continue
+    gw="${dest%/128}"
+    if ipv6_in_prefix "$gw" "$probe_prefix"; then
+      echo "$gw"
+      return 0
+    fi
+  done < <(ip -6 route show dev "$iface" 2>/dev/null)
+
+  return 1
 }
 
 load_existing_native_hint() {
@@ -2981,26 +3090,54 @@ leases_json="$(echo "$status_json" | jq -c '
     elif (type == "object") then [.]
     else []
     end;
-  ((.leases | to_arr) + (.lease | to_arr))
+  def lease_sources:
+    [
+      .,
+      .data?,
+      .result?,
+      .payload?
+    ];
+  [
+    lease_sources[]?
+    | ((. | to_arr) + (.leases | to_arr) + (.lease | to_arr))[]
+  ]
   | map(select(type == "object"))
   | unique_by(.ipv6_cidr // "")
 ')"
 
 declare -A GW_BY_CIDR=()
 declare -A CODE_BY_CIDR=()
+declare -A PREFIX_BY_CIDR=()
+declare -A GW_BY_CIDR_KEY=()
+declare -A CODE_BY_CIDR_KEY=()
+declare -A PREFIX_BY_CIDR_KEY=()
 
-while IFS='|' read -r cidr gw code; do
+while IFS='|' read -r cidr gw code prefix; do
+  cidr_key=""
   [[ -n "$cidr" ]] || continue
-  [[ -n "$gw" ]] || continue
   [[ -n "$code" ]] || code="unknown"
-  GW_BY_CIDR["$cidr"]="$gw"
+  [[ -n "$prefix" && "$prefix" != "null" ]] || prefix=""
+  [[ -n "$gw" && "$gw" != "null" ]] || gw=""
+
   CODE_BY_CIDR["$cidr"]="$code"
+  PREFIX_BY_CIDR["$cidr"]="$prefix"
+  if [[ -n "$gw" ]]; then
+    GW_BY_CIDR["$cidr"]="$gw"
+  fi
+
+  cidr_key="$(normalize_cidr_key "$cidr" 2>/dev/null || true)"
+  if [[ -n "$cidr_key" ]]; then
+    CODE_BY_CIDR_KEY["$cidr_key"]="$code"
+    PREFIX_BY_CIDR_KEY["$cidr_key"]="$prefix"
+    if [[ -n "$gw" ]]; then
+      GW_BY_CIDR_KEY["$cidr_key"]="$gw"
+    fi
+  fi
 done < <(
   echo "$leases_json" | jq -r '
     .[]
     | select((.ipv6_cidr? | type) == "string" and (.ipv6_cidr | length > 0))
-    | select((.gateway?   | type) == "string" and (.gateway   | length > 0))
-    | "\(.ipv6_cidr)|\(.gateway)|\(.wg_interface? // "unknown")"
+    | "\(.ipv6_cidr)|\(if (.gateway? | type) == "string" then .gateway else "" end)|\(.wg_interface? // .region? // .location? // "unknown")|\(if (.prefix? | type) == "string" then .prefix else "" end)"
   '
 )
 
@@ -3014,12 +3151,39 @@ declare -A CODE_ORDERS=()
 
 for cidr in "${CIDRS[@]}"; do
   ip_only="${cidr%/*}"
+  cidr_key="$(normalize_cidr_key "$cidr" 2>/dev/null || true)"
   gw="${GW_BY_CIDR[$cidr]:-}"
+  prefix="${PREFIX_BY_CIDR[$cidr]:-}"
   raw_code="${CODE_BY_CIDR[$cidr]:-unknown}"
+
+  if [[ -n "$cidr_key" ]]; then
+    [[ -n "$gw" ]] || gw="${GW_BY_CIDR_KEY[$cidr_key]:-}"
+    [[ -n "$prefix" ]] || prefix="${PREFIX_BY_CIDR_KEY[$cidr_key]:-}"
+    if [[ "$raw_code" == "unknown" ]]; then
+      raw_code="${CODE_BY_CIDR_KEY[$cidr_key]:-unknown}"
+    fi
+  fi
+
   code="$(normalize_region_code "$raw_code")"
 
   if [[ -z "$gw" ]]; then
-    log warn "跳过: $cidr，API 未返回对应 gateway"
+    gw="$(route_gateway_for_dynamic_cidr "$cidr" "$prefix" "$IFACE" 2>/dev/null || true)"
+    if [[ -n "$gw" ]]; then
+      log warn "API 未返回 $cidr 的 gateway，已从当前路由表推导为 $gw"
+    fi
+  fi
+
+  if [[ -z "$gw" ]]; then
+    if [[ -n "$prefix" ]]; then
+      gw="$(dynamic_gateway_guess_from_prefix "$prefix" 2>/dev/null || true)"
+      if [[ -n "$gw" ]]; then
+        log warn "API 未返回 $cidr 的 gateway，已根据前缀 $prefix 推导为 $gw"
+      fi
+    fi
+  fi
+
+  if [[ -z "$gw" ]]; then
+    log warn "跳过: $cidr，API 未返回 gateway，且无法从 prefix/路由表推导"
     continue
   fi
 

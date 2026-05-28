@@ -21,7 +21,7 @@
 一键安装
 
 ```
-wget -O install.sh https://raw.githubusercontent.com/endview/aether-v6-switch/main/v6.sh && chmod +x install.sh && sudo bash install.sh
+wget -O v6.sh https://raw.githubusercontent.com/endview/aether-v6-switch/main/v6.sh && chmod +x v6.sh && sudo bash v6.sh
 ```
 
 
