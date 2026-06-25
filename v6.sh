@@ -15,6 +15,7 @@ QH_PRIORITY_GUIDE_FILE="${QH_CONFIG_DIR}/priority.guide.done"
 QH_AUTO_CONFIG_FILE="${QH_CONFIG_DIR}/auto.env"
 QH_STATE_DIR="/var/lib/qh"
 QH_LAST_PROBE_FILE="${QH_STATE_DIR}/last_probe.tsv"
+QH_ROUTE_FIX_FILE="${QH_STATE_DIR}/route_fix.tsv"
 QH_AUTO_SERVICE="/etc/systemd/system/qh-autoheal.service"
 QH_AUTO_TIMER="/etc/systemd/system/qh-autoheal.timer"
 QH_AUTO_CRON="/etc/cron.d/qh-autoheal"
@@ -42,9 +43,6 @@ PROBE_PING_TIMEOUT="${QH_IPV6_PROBE_TIMEOUT:-3}"
 STYLE_STEP=""
 
 if [[ -t 0 && -t 1 ]]; then
-  INTERACTIVE=1
-elif exec {__tty_probe_fd}<>/dev/tty 2>/dev/null; then
-  exec {__tty_probe_fd}>&-
   INTERACTIVE=1
 fi
 
@@ -1091,6 +1089,7 @@ write_switch_script() {
     emit_scalar "AUTO_CONFIG_FILE" "$QH_AUTO_CONFIG_FILE"
     emit_scalar "STATE_DIR" "$QH_STATE_DIR"
     emit_scalar "LAST_PROBE_FILE" "$QH_LAST_PROBE_FILE"
+    emit_scalar "ROUTE_FIX_FILE" "$QH_ROUTE_FIX_FILE"
     emit_scalar "AUTO_SERVICE" "$QH_AUTO_SERVICE"
     emit_scalar "AUTO_TIMER" "$QH_AUTO_TIMER"
     emit_scalar "AUTO_CRON" "$QH_AUTO_CRON"
@@ -1112,9 +1111,6 @@ INTERACTIVE=0
 SCHEDULED=0
 if [[ -t 0 && -t 1 ]]; then
   INTERACTIVE=1
-elif exec {__tty_probe_fd}<>/dev/tty 2>/dev/null; then
-  exec {__tty_probe_fd}>&-
-  INTERACTIVE=1
 fi
 
 STYLE_RESET=""
@@ -1126,6 +1122,12 @@ STYLE_ERROR=""
 PROBE_IPV6_TARGET="${QH_IPV6_PROBE_TARGET:-2606:4700:4700::1111}"
 PROBE_PING_COUNT="${QH_IPV6_PROBE_COUNT:-2}"
 PROBE_PING_TIMEOUT="${QH_IPV6_PROBE_TIMEOUT:-3}"
+PROBE_HTTP_URL="${QH_IPV6_HTTP_PROBE_URL:-https://ipv6.icanhazip.com}"
+PROBE_HTTP_TIMEOUT="${QH_IPV6_HTTP_TIMEOUT:-8}"
+PROBE_HTTP_MAX_TIME="${QH_IPV6_HTTP_MAX_TIME:-15}"
+PROBE_MTU_SAFE_PAYLOAD="${QH_IPV6_MTU_SAFE_PAYLOAD:-1232}"
+PROBE_MTU_LARGE_PAYLOAD="${QH_IPV6_MTU_LARGE_PAYLOAD:-1360}"
+DEFAULT_REPAIR_MTU="${QH_IPV6_REPAIR_MTU:-1280}"
 AUTO_SWITCH_ENABLED="0"
 AUTO_INTERVAL_MINUTES="$AUTO_INTERVAL_MINUTES_DEFAULT"
 
@@ -1285,6 +1287,10 @@ route_onlink() {
   grep -qw onlink <<<"$1" && echo "1" || echo "0"
 }
 
+route_mtu() {
+  sed -n 's/.* mtu \([0-9]\+\).*/\1/p' <<<"$1"
+}
+
 strip_cidr() {
   echo "${1%/*}"
 }
@@ -1425,29 +1431,32 @@ replace_default_route() {
   local src="$2"
   local metric="$3"
   local onlink="$4"
+  local mtu="${5:-}"
 
   local cmd=(ip -6 route replace default via "$via" dev "$IFACE")
   [[ -n "$src" ]] && cmd+=(src "$src")
   [[ -n "$metric" ]] && cmd+=(metric "$metric")
   [[ "$onlink" == "1" ]] && cmd+=(onlink)
+  [[ -n "$mtu" ]] && cmd+=(mtu "$mtu")
   "${cmd[@]}"
 }
 
 restore_default_from_line() {
   local line="$1"
-  local via src metric onlink
+  local via src metric onlink mtu
 
   via="$(route_field "$line" "via")"
   src="$(route_field "$line" "src")"
   metric="$(route_metric "$line")"
   onlink="$(route_onlink "$line")"
+  mtu="$(route_mtu "$line")"
 
   [[ -n "$via" ]] || return 1
   [[ -n "$metric" ]] || metric="1024"
 
   ensure_gateway_route "$via"
 
-  replace_default_route "$via" "$src" "$metric" "$onlink"
+  replace_default_route "$via" "$src" "$metric" "$onlink" "$mtu"
 }
 
 restore_previous_route_safely() {
@@ -1554,6 +1563,48 @@ load_priority_order() {
 
   PRIORITY_ORDER=("${ordered[@]}")
   save_priority_order
+}
+
+valid_route_mtu() {
+  local mtu="${1:-}"
+  [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
+  (( mtu >= 1280 && mtu <= 1500 ))
+}
+
+route_mtu_for_selector() {
+  local selector="$1"
+  local mtu
+
+  ensure_runtime_dirs
+  [[ -f "$ROUTE_FIX_FILE" ]] || return 1
+  mtu="$(awk -v selector="$selector" '$1 == selector && $2 ~ /^[0-9]+$/ { print $2; exit }' "$ROUTE_FIX_FILE")"
+  valid_route_mtu "$mtu" || return 1
+  echo "$mtu"
+}
+
+save_route_mtu_for_selector() {
+  local selector="$1"
+  local mtu="$2"
+  local tmp
+
+  selector="${selector,,}"
+  selector_known "$selector" || { log error "未知线路: $selector"; return 1; }
+  valid_route_mtu "$mtu" || { log error "MTU 应在 1280 到 1500 之间"; return 1; }
+
+  ensure_runtime_dirs
+  tmp="$(mktemp "${STATE_DIR}/route_fix.XXXXXX")"
+  if [[ -f "$ROUTE_FIX_FILE" ]]; then
+    awk -v selector="$selector" -v mtu="$mtu" '
+      BEGIN { done = 0 }
+      $1 == selector { print selector "	" mtu; done = 1; next }
+      NF >= 2 { print $0 }
+      END { if (!done) print selector "	" mtu }
+    ' "$ROUTE_FIX_FILE" > "$tmp"
+  else
+    printf '%s\t%s\n' "$selector" "$mtu" > "$tmp"
+  fi
+  mv "$tmp" "$ROUTE_FIX_FILE"
+  chmod 600 "$ROUTE_FIX_FILE"
 }
 
 priority_of_selector() {
@@ -1921,6 +1972,62 @@ probe_ipv6_route_only() {
   return 127
 }
 
+probe_mtu_payload() {
+  local bind="$1"
+  local payload="$2"
+  if command -v ping >/dev/null 2>&1; then
+    ping -6 -n -c 1 -W "$PROBE_PING_TIMEOUT" -M do -s "$payload" -I "$bind" "$PROBE_IPV6_TARGET" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v ping6 >/dev/null 2>&1; then
+    ping6 -n -c 1 -W "$PROBE_PING_TIMEOUT" -M do -s "$payload" -I "$bind" "$PROBE_IPV6_TARGET" >/dev/null 2>&1
+    return $?
+  fi
+  return 127
+}
+
+probe_http_only() {
+  local bind="$1"
+  command -v curl >/dev/null 2>&1 || { log error "缺少 curl，无法执行 HTTPS 出口检测"; return 127; }
+  curl -6 --interface "$bind" --connect-timeout "$PROBE_HTTP_TIMEOUT" -m "$PROBE_HTTP_MAX_TIME" -fsS -o /dev/null "$PROBE_HTTP_URL" >/dev/null 2>&1
+}
+
+probe_http_public_ip() {
+  local bind="$1"
+  command -v curl >/dev/null 2>&1 || return 127
+  curl -6 --interface "$bind" --connect-timeout "$PROBE_HTTP_TIMEOUT" -m "$PROBE_HTTP_MAX_TIME" -fsS "$PROBE_HTTP_URL" 2>/dev/null | head -n 1
+}
+
+print_route_diagnostics() {
+  local bind="$1"
+  local route_line neigh_via neigh_line
+  if [[ "$bind" == *:* ]]; then
+    route_line="$(ip -6 route get "$PROBE_IPV6_TARGET" from "$bind" oif "$IFACE" 2>/dev/null | awk 'NR == 1 { print; exit }' || true)"
+  else
+    route_line="$(ip -6 route get "$PROBE_IPV6_TARGET" oif "$IFACE" 2>/dev/null | awk 'NR == 1 { print; exit }' || true)"
+  fi
+  status_line "路由选择" "${route_line:-<无法获取>}"
+  neigh_via="$(route_field "$route_line" "via")"
+  if [[ -n "$neigh_via" ]]; then
+    neigh_line="$(ip -6 neigh show dev "$IFACE" 2>/dev/null | awk -v via="$neigh_via" '$1 == via { print; exit }' || true)"
+    status_line "网关邻居" "${neigh_line:-<未解析>}"
+  fi
+}
+
+print_mtu_probe_summary() {
+  local bind="$1"
+  if probe_mtu_payload "$bind" "$PROBE_MTU_SAFE_PAYLOAD"; then
+    status_line "MTU 安全包" "${PROBE_MTU_SAFE_PAYLOAD} payload 正常"
+  else
+    status_line "MTU 安全包" "${PROBE_MTU_SAFE_PAYLOAD} payload 异常"
+  fi
+  if probe_mtu_payload "$bind" "$PROBE_MTU_LARGE_PAYLOAD"; then
+    status_line "MTU 大包" "${PROBE_MTU_LARGE_PAYLOAD} payload 正常"
+  else
+    status_line "MTU 大包" "${PROBE_MTU_LARGE_PAYLOAD} payload 异常或被本机 MTU 限制"
+  fi
+}
+
 probe_native_ipv6_only() {
   local rc
 
@@ -1964,6 +2071,7 @@ probe_result_text() {
 probe_resolved_target() {
   local resolved="$1"
   local previous_line selector target_name source_label bind result rc priority
+  local icmp_ok=0 http_ok=0 public_ip=""
 
   previous_line="$(pick_best_default_route "$IFACE" || true)"
   selector="$(resolved_selector_name "$resolved")"
@@ -1977,15 +2085,30 @@ probe_resolved_target() {
   if apply_resolved_target "$resolved"; then
     if [[ "$resolved" == "native" ]]; then
       if probe_native_ipv6_only; then
-        result="OK"
+        icmp_ok=1
       else
         rc=$?
-        result="FAIL($rc)"
       fi
     elif probe_ipv6_only "$bind"; then
-      result="OK"
+      icmp_ok=1
     else
       rc=$?
+    fi
+
+    if (( icmp_ok == 1 )); then
+      if probe_http_only "$bind"; then
+        http_ok=1
+        public_ip="$(probe_http_public_ip "$bind" || true)"
+      else
+        rc=$?
+      fi
+    fi
+
+    if (( icmp_ok == 1 && http_ok == 1 )); then
+      result="OK"
+      rc=0
+    else
+      [[ "$rc" -eq 0 ]] && rc=1
       result="FAIL($rc)"
     fi
   else
@@ -1997,16 +2120,25 @@ probe_resolved_target() {
   LAST_SCAN_SELECTORS+=("$selector")
   LAST_SCAN_RESULTS+=("$result")
   if (( QUIET == 0 )); then
-    printf -- '- %s | %s\n' "$selector" "$target_name"
-    printf '  优先级: %s\n' "${priority:--}"
-    printf '  源地址: %s\n' "$source_label"
-    printf '  连通性测试：%s\n' "$(probe_result_text "$result")"
+    printf -- '- %s | %s
+' "$selector" "$target_name"
+    printf '  优先级: %s
+' "${priority:--}"
+    printf '  源地址: %s
+' "$source_label"
+    printf '  ICMPv6 小包：%s
+' "$([[ "$icmp_ok" == "1" ]] && echo 正常 || echo 异常)"
+    print_mtu_probe_summary "$bind"
+    printf '  HTTPS 出口：%s%s
+' "$([[ "$http_ok" == "1" ]] && echo 正常 || echo 异常)" "${public_ip:+ ($public_ip)}"
+    printf '  综合结果：%s
+' "$(probe_result_text "$result")"
   fi
   return "$rc"
 }
 
 test_connectivity() {
-  local line bind current
+  local line bind current quick_ok=0 http_ok=0 public_ip=""
 
   line="$(pick_best_default_route "$IFACE" || true)"
   current="$(current_selector)"
@@ -2016,38 +2148,53 @@ test_connectivity() {
   section_title "当前线路连通性测试"
   status_line "当前线路" "$(describe_selection "$current")"
   status_line "检测绑定" "$bind"
-  status_line "检测目标" "$PROBE_IPV6_TARGET"
+  status_line "ICMP 目标" "$PROBE_IPV6_TARGET"
+  status_line "HTTPS 目标" "$PROBE_HTTP_URL"
+  print_route_diagnostics "$bind"
 
   if [[ "$current" == "native" ]]; then
-    if probe_native_ipv6_only; then
-      log success "连通性测试：正常"
-      return 0
-    fi
+    if probe_native_ipv6_only; then quick_ok=1; fi
   elif probe_ipv6_only "$bind"; then
-    log success "连通性测试：正常"
-    return 0
+    quick_ok=1
   fi
 
-  local rc=$?
-  log error "连通性测试：异常"
-  return "$rc"
+  if (( quick_ok == 1 )); then log success "ICMPv6 小包连通：正常"; else log error "ICMPv6 小包连通：异常"; fi
+  print_mtu_probe_summary "$bind"
+
+  if probe_http_only "$bind"; then
+    http_ok=1
+    public_ip="$(probe_http_public_ip "$bind" || true)"
+    log success "HTTPS 出口检测：正常${public_ip:+，出口 $public_ip}"
+  else
+    log error "HTTPS 出口检测：异常"
+    if (( quick_ok == 1 )); then
+      log warn "ICMPv6 小包正常但 HTTPS 异常，常见原因是 PMTU/MTU 黑洞；可执行 qh repair ${current} 尝试降 MTU 修复"
+    fi
+  fi
+  (( quick_ok == 1 && http_ok == 1 ))
 }
 
 apply_native_impl() {
+  local mtu=""
+  mtu="$(route_mtu_for_selector native 2>/dev/null || true)"
   clear_defaults
   clear_gateway_routes
   ensure_gateway_route "$NATIVE_VIA"
-  replace_default_route "$NATIVE_VIA" "$NATIVE_SRC" "$NATIVE_METRIC" "$NATIVE_ONLINK"
+  replace_default_route "$NATIVE_VIA" "$NATIVE_SRC" "$NATIVE_METRIC" "$NATIVE_ONLINK" "$mtu"
 }
 
 apply_dynamic_impl() {
   local idx="$1"
   local gw="${GWS[$idx]}"
+  local selector mtu
+
+  selector="${SELECTORS[$idx]}"
+  mtu="$(route_mtu_for_selector "$selector" 2>/dev/null || true)"
 
   clear_defaults
   clear_gateway_routes
   ensure_gateway_route "$gw"
-  replace_default_route "$gw" "${IPS[$idx]}" "100" "0"
+  replace_default_route "$gw" "${IPS[$idx]}" "100" "0" "$mtu"
 }
 
 switch_with_rollback() {
@@ -2072,6 +2219,62 @@ switch_with_rollback() {
   fi
   show_status
   return "$rc"
+}
+
+apply_route_mtu_fix() {
+  local resolved="$1"
+  local mtu="${2:-$DEFAULT_REPAIR_MTU}"
+  local selector
+  selector="$(resolved_selector_name "$resolved")"
+  save_route_mtu_for_selector "$selector" "$mtu"
+  apply_resolved_target "$resolved"
+  log success "已为线路 $selector 写入并应用 MTU $mtu 修复"
+}
+
+repair_target() {
+  local token="${1:-}"
+  local mtu="${2:-$DEFAULT_REPAIR_MTU}"
+  local current resolved selector bind public_ip
+  valid_route_mtu "$mtu" || { log error "MTU 应在 1280 到 1500 之间"; return 1; }
+  if [[ -z "$token" ]]; then
+    current="$(current_selector)"
+    [[ "$current" != "none" && "$current" != "unknown" ]] || { log error "当前线路无法识别，请指定要修复的线路，例如 qh repair jp-1"; return 1; }
+    resolved="$(selector_to_resolved "$current")"
+  else
+    resolved="$(resolve_target "$token")" || { log error "未找到线路: $token"; return 1; }
+  fi
+  selector="$(resolved_selector_name "$resolved")"
+  bind="$(resolved_probe_bind "$resolved")"
+  section_title "线路检测与修复"
+  status_line "目标线路" "$selector | $(resolved_target_name "$resolved")"
+  status_line "源地址" "$bind"
+  status_line "修复 MTU" "$mtu"
+  apply_resolved_target "$resolved"
+  print_route_diagnostics "$bind"
+  if probe_ipv6_only "$bind"; then
+    log success "ICMPv6 小包连通：正常"
+  else
+    log error "ICMPv6 小包连通：异常；这不像单纯 MTU 问题，请先检查网关/路由/NDP"
+    print_mtu_probe_summary "$bind"
+    return 1
+  fi
+  print_mtu_probe_summary "$bind"
+  if probe_http_only "$bind"; then
+    public_ip="$(probe_http_public_ip "$bind" || true)"
+    log success "HTTPS 出口检测已正常${public_ip:+，出口 $public_ip}，无需修复"
+    return 0
+  fi
+  log warn "HTTPS 出口检测异常，开始应用 MTU $mtu 修复"
+  apply_route_mtu_fix "$resolved" "$mtu"
+  if probe_http_only "$bind"; then
+    public_ip="$(probe_http_public_ip "$bind" || true)"
+    log success "修复后 HTTPS 出口检测正常${public_ip:+，出口 $public_ip}"
+    print_route_diagnostics "$bind"
+    return 0
+  fi
+  log error "已应用 MTU $mtu，但 HTTPS 仍异常；请检查上游 ACL、防火墙或回程路由"
+  print_route_diagnostics "$bind"
+  return 1
 }
 
 probe_target() {
@@ -2161,7 +2364,7 @@ probe_all_targets() {
   local rc=0
   local result
 
-  log info "开始逐条检测全部线路的 IPv6 连通性（仅 ICMPv6，不触及 IPv4）"
+  log info "开始逐条检测全部线路的 IPv6/HTTPS/MTU 连通性（仅 IPv6，不触及 IPv4）"
   scan_all_targets || rc=1
 
   for result in "${LAST_SCAN_RESULTS[@]}"; do
@@ -2393,7 +2596,8 @@ usage() {
   qh                         进入交互菜单
   qh list                    查看全部线路
   qh status                  查看当前状态
-  qh test                    检测当前线路 IPv6 连通性
+  qh test                    检测当前线路 IPv6/HTTPS/MTU 连通性
+  qh repair [目标] [MTU]      检测并尝试用 MTU 修复线路，默认 MTU 1280
   qh probe                   逐条检测全部线路 IPv6 连通性
   qh probe <目标>            检测指定线路 IPv6 连通性
   qh priority list           查看优先级顺序
@@ -2415,6 +2619,8 @@ usage() {
   qh jp-2
   qh probe
   qh probe jp-2
+  qh repair jp-2
+  qh repair jp-2 1280
   qh priority list
   qh priority set jp-1 1
   qh priority wizard
@@ -2664,7 +2870,7 @@ remove_auto_scheduler_artifacts() {
 
 cleanup_qh_runtime_files() {
   remove_auto_scheduler_artifacts
-  rm -f "$PRIORITY_FILE" "$PRIORITY_GUIDE_FILE" "$AUTO_CONFIG_FILE" "$LAST_PROBE_FILE"
+  rm -f "$PRIORITY_FILE" "$PRIORITY_GUIDE_FILE" "$AUTO_CONFIG_FILE" "$LAST_PROBE_FILE" "$ROUTE_FIX_FILE"
   rm -rf "$CONFIG_DIR" "$STATE_DIR"
 }
 
@@ -2840,6 +3046,9 @@ main() {
       ;;
     probe)
       probe_target "${ARGS[1]:-}" "${ARGS[2]:-}"
+      ;;
+    repair)
+      repair_target "${ARGS[1]:-}" "${ARGS[2]:-}"
       ;;
     auto)
       handle_auto_command "${ARGS[1]:-run}"
