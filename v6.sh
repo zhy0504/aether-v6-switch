@@ -2051,17 +2051,49 @@ print_route_diagnostics() {
   fi
 }
 
+route_effective_mtu_for_bind() {
+  local bind="$1"
+  local route_line route_mtu iface_mtu
+
+  if [[ "$bind" == *:* ]]; then
+    route_line="$(ip -6 route get "$PROBE_IPV6_TARGET" from "$bind" oif "$IFACE" 2>/dev/null | awk 'NR == 1 { print; exit }' || true)"
+  else
+    route_line="$(ip -6 route get "$PROBE_IPV6_TARGET" oif "$IFACE" 2>/dev/null | awk 'NR == 1 { print; exit }' || true)"
+  fi
+
+  route_mtu="$(route_field "$route_line" "mtu")"
+  if valid_route_mtu "$route_mtu"; then
+    echo "$route_mtu"
+    return 0
+  fi
+
+  iface_mtu="$(ip -o link show dev "$IFACE" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "mtu") { print $(i + 1); exit } }')"
+  [[ "$iface_mtu" =~ ^[0-9]+$ ]] || return 1
+  echo "$iface_mtu"
+}
+
 print_mtu_probe_summary() {
   local bind="$1"
+  local effective_mtu="" large_wire_size
+
+  effective_mtu="$(route_effective_mtu_for_bind "$bind" 2>/dev/null || true)"
+  if [[ -n "$effective_mtu" ]]; then
+    status_line "路径 MTU" "$effective_mtu"
+  fi
+
   if probe_mtu_payload "$bind" "$PROBE_MTU_SAFE_PAYLOAD"; then
     status_line "MTU 安全包" "${PROBE_MTU_SAFE_PAYLOAD} payload 正常"
   else
     status_line "MTU 安全包" "${PROBE_MTU_SAFE_PAYLOAD} payload 异常"
   fi
+
+  large_wire_size=$((PROBE_MTU_LARGE_PAYLOAD + 48))
   if probe_mtu_payload "$bind" "$PROBE_MTU_LARGE_PAYLOAD"; then
-    status_line "MTU 大包" "${PROBE_MTU_LARGE_PAYLOAD} payload 正常"
+    status_line "MTU 大包探测" "${PROBE_MTU_LARGE_PAYLOAD} payload 正常"
+  elif [[ "$effective_mtu" =~ ^[0-9]+$ && "$large_wire_size" -gt "$effective_mtu" ]]; then
+    status_line "MTU 大包探测" "${PROBE_MTU_LARGE_PAYLOAD} payload 受本机路径 MTU ${effective_mtu} 限制（预期，不影响综合结果）"
   else
-    status_line "MTU 大包" "${PROBE_MTU_LARGE_PAYLOAD} payload 异常或被本机 MTU 限制"
+    status_line "MTU 大包探测" "${PROBE_MTU_LARGE_PAYLOAD} payload 未通过（仅作诊断，综合结果以 ICMPv6 小包和 HTTPS 为准）"
   fi
 }
 
