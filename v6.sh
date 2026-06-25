@@ -51,6 +51,7 @@ CURL_BASE_ARGS=(
   --silent
   --show-error
   --location
+  --ipv4
   --connect-timeout 10
   --retry 2
   --retry-delay 1
