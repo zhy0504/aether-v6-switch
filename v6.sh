@@ -1427,6 +1427,41 @@ ensure_gateway_route() {
   ip -6 route replace "${gw}/128" dev "$IFACE" metric 1023 onlink
 }
 
+source_rule_table_for_src() {
+  local src="$1"
+  [[ -n "$src" && "$src" == *:* ]] || return 1
+  ip -6 rule show 2>/dev/null | awk -v src="$src" '
+    $0 ~ "from " src "(/128)? " {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "lookup") {
+          print $(i + 1)
+          exit
+        }
+      }
+    }
+  '
+}
+
+replace_policy_default_route_for_src() {
+  local via="$1"
+  local src="$2"
+  local metric="$3"
+  local mtu="${4:-}"
+  local table cmd
+
+  table="$(source_rule_table_for_src "$src" || true)"
+  [[ "$table" =~ ^[0-9]+$ ]] || return 0
+  [[ -n "$metric" ]] || metric="1024"
+
+  if [[ "${via,,}" != fe80:* ]]; then
+    ip -6 route replace "${via}/128" dev "$IFACE" metric "$metric" onlink table "$table" 2>/dev/null || true
+  fi
+
+  cmd=(ip -6 route replace default via "$via" dev "$IFACE" src "$src" metric "$metric" onlink table "$table")
+  [[ -n "$mtu" ]] && cmd+=(mtu "$mtu")
+  "${cmd[@]}" 2>/dev/null || true
+}
+
 replace_default_route() {
   local via="$1"
   local src="$2"
@@ -1440,6 +1475,7 @@ replace_default_route() {
   [[ "$onlink" == "1" ]] && cmd+=(onlink)
   [[ -n "$mtu" ]] && cmd+=(mtu "$mtu")
   "${cmd[@]}"
+  [[ -n "$src" ]] && replace_policy_default_route_for_src "$via" "$src" "$metric" "$mtu"
 }
 
 restore_default_from_line() {
