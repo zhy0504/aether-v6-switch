@@ -44,7 +44,7 @@ STYLE_STEP=""
 
 if [[ -t 0 && -t 1 ]]; then
   INTERACTIVE=1
-elif exec {__tty_probe_fd}<>/dev/tty 2>/dev/null; then
+elif { exec {__tty_probe_fd}<>/dev/tty; } 2>/dev/null; then
   exec {__tty_probe_fd}>&-
   INTERACTIVE=1
 fi
@@ -1118,7 +1118,7 @@ INTERACTIVE=0
 SCHEDULED=0
 if [[ -t 0 && -t 1 ]]; then
   INTERACTIVE=1
-elif exec {__tty_probe_fd}<>/dev/tty 2>/dev/null; then
+elif { exec {__tty_probe_fd}<>/dev/tty; } 2>/dev/null; then
   exec {__tty_probe_fd}>&-
   INTERACTIVE=1
 fi
