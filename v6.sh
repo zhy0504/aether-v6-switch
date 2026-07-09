@@ -1136,6 +1136,11 @@ PROBE_PING_TIMEOUT="${QH_IPV6_PROBE_TIMEOUT:-3}"
 PROBE_HTTP_TIMEOUT="${QH_IPV6_HTTP_TIMEOUT:-10}"
 PROBE_MTU_OK_SIZE="${QH_IPV6_MTU_OK_SIZE:-1200}"
 PROBE_MTU_BOUNDARY_SIZE="${QH_IPV6_MTU_BOUNDARY_SIZE:-1232}"
+MTU_AUTO_MIN="${QH_IPV6_MTU_AUTO_MIN:-1280}"
+MTU_AUTO_MAX="${QH_IPV6_MTU_AUTO_MAX:-}"
+MTU_AUTO_PING_COUNT="${QH_IPV6_MTU_AUTO_PING_COUNT:-20}"
+MTU_AUTO_PING_INTERVAL="${QH_IPV6_MTU_AUTO_PING_INTERVAL:-0.1}"
+MTU_AUTO_MAX_LOSS_PERCENT="${QH_IPV6_MTU_AUTO_MAX_LOSS_PERCENT:-5}"
 AUTO_SWITCH_ENABLED="0"
 AUTO_INTERVAL_MINUTES="$AUTO_INTERVAL_MINUTES_DEFAULT"
 
@@ -1640,7 +1645,7 @@ show_route_repairs() {
   local selector mtu
   section_title "线路 MTU 修复记录"
   if [[ ! -s "$ROUTE_FIX_FILE" ]]; then
-    section_note "暂无记录。可使用 qh repair [目标] [MTU] 添加，例如: qh repair current 1280"
+    section_note "暂无记录。可使用 qh repair [目标] auto 自动探测最大稳定 MTU，或手动指定数值。"
     return 0
   fi
   while IFS=$'\t' read -r selector mtu _; do
@@ -1923,7 +1928,7 @@ resolved_matches_native_route() {
 route_line_matches_resolved() {
   local line="$1"
   local resolved="$2"
-  local via src want_via want_src
+  local via src want_via want_src want_mtu have_mtu
 
   [[ -n "$line" ]] || return 1
 
@@ -1931,10 +1936,17 @@ route_line_matches_resolved() {
   src="$(route_field "$line" "src")"
   want_via="$(resolved_gateway "$resolved")"
   want_src="$(resolved_expected_src "$resolved")"
+  want_mtu="$(resolved_route_mtu "$resolved" 2>/dev/null || true)"
+  have_mtu="$(route_mtu "$line")"
 
   ipv6_equal "$via" "$want_via" || return 1
-  [[ -z "$want_src" ]] && return 0
-  ipv6_equal "$src" "$want_src"
+  if [[ -n "$want_src" ]]; then
+    ipv6_equal "$src" "$want_src" || return 1
+  fi
+  if [[ -n "$want_mtu" ]]; then
+    [[ "$have_mtu" == "$want_mtu" ]] || return 1
+  fi
+  return 0
 }
 
 current_route_matches_resolved() {
@@ -1979,6 +1991,24 @@ apply_resolved_target() {
     apply_native_impl
   else
     apply_dynamic_impl "$resolved"
+  fi
+}
+
+apply_resolved_target_mtu() {
+  local resolved="$1"
+  local mtu="$2"
+  local gw
+
+  validate_mtu "$mtu" || return 1
+  clear_defaults
+  clear_gateway_routes
+  if [[ "$resolved" == "native" ]]; then
+    ensure_gateway_route "$NATIVE_VIA"
+    replace_default_route "$NATIVE_VIA" "$NATIVE_SRC" "$NATIVE_METRIC" "$NATIVE_ONLINK" "$mtu"
+  else
+    gw="${GWS[$resolved]}"
+    ensure_gateway_route "$gw"
+    replace_default_route "$gw" "${IPS[$resolved]}" "100" "0" "$mtu"
   fi
 }
 
@@ -2054,6 +2084,120 @@ probe_mtu_size() {
   fi
 
   return 127
+}
+
+icmp_payload_for_mtu() {
+  local mtu="$1"
+  [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
+  (( mtu >= 48 )) || return 1
+  echo "$((mtu - 48))"
+}
+
+route_mtu_upper_bound() {
+  local bind="$1"
+  local route mtu link_mtu
+
+  route="$(route_get_for_bind "$bind" || true)"
+  mtu="$(route_mtu "$route")"
+  if validate_mtu "$mtu"; then
+    echo "$mtu"
+    return 0
+  fi
+
+  link_mtu="$(ip -o link show dev "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}' || true)"
+  if validate_mtu "$link_mtu"; then
+    echo "$link_mtu"
+    return 0
+  fi
+
+  echo 1500
+}
+
+probe_mtu_once() {
+  local bind="$1"
+  local mtu="$2"
+  local payload
+
+  payload="$(icmp_payload_for_mtu "$mtu")" || return 2
+  probe_mtu_size "$bind" "$payload"
+}
+
+probe_mtu_stable() {
+  local bind="$1"
+  local mtu="$2"
+  local count="${3:-$MTU_AUTO_PING_COUNT}"
+  local payload out stats loss
+
+  validate_mtu "$mtu" || return 2
+  [[ "$count" =~ ^[0-9]+$ ]] || count=20
+  (( count > 0 )) || count=20
+  payload="$(icmp_payload_for_mtu "$mtu")" || return 2
+
+  if command -v ping >/dev/null 2>&1; then
+    out="$(ping -6 -n -c "$count" -i "$MTU_AUTO_PING_INTERVAL" -W "$PROBE_PING_TIMEOUT" -M do -s "$payload" -I "$bind" "$PROBE_IPV6_TARGET" 2>&1 || true)"
+  elif command -v ping6 >/dev/null 2>&1; then
+    out="$(ping6 -n -c "$count" -i "$MTU_AUTO_PING_INTERVAL" -W "$PROBE_PING_TIMEOUT" -M do -s "$payload" -I "$bind" "$PROBE_IPV6_TARGET" 2>&1 || true)"
+  else
+    return 127
+  fi
+
+  stats="$(grep -E 'packets transmitted' <<<"$out" | tail -n1 || true)"
+  loss="$(sed -n 's/.* \([0-9.][0-9.]*\)% packet loss.*/\1/p' <<<"$stats" | head -n1)"
+  if [[ -z "$loss" ]]; then
+    return 1
+  fi
+
+  awk -v loss="$loss" -v max="$MTU_AUTO_MAX_LOSS_PERCENT" 'BEGIN { exit (loss <= max ? 0 : 1) }'
+}
+
+detect_max_stable_mtu() {
+  local resolved="$1"
+  local bind="$2"
+  local min_mtu="${3:-$MTU_AUTO_MIN}"
+  local max_mtu="${4:-}"
+  local low high mid best candidate step link_mtu
+
+  validate_mtu "$min_mtu" || min_mtu=1280
+  if [[ -z "$max_mtu" ]]; then
+    if [[ -n "$MTU_AUTO_MAX" ]]; then
+      max_mtu="$MTU_AUTO_MAX"
+    else
+      link_mtu="$(ip -o link show dev "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}' || true)"
+      if validate_mtu "$link_mtu"; then
+        max_mtu="$link_mtu"
+      else
+        max_mtu=1500
+      fi
+    fi
+  fi
+  validate_mtu "$max_mtu" || max_mtu=1500
+  (( max_mtu >= min_mtu )) || max_mtu="$min_mtu"
+
+  low="$min_mtu"
+  high="$max_mtu"
+  best=0
+  while (( low <= high )); do
+    mid=$(((low + high) / 2))
+    if apply_resolved_target_mtu "$resolved" "$mid" && probe_mtu_once "$bind" "$mid"; then
+      best="$mid"
+      low=$((mid + 1))
+    else
+      high=$((mid - 1))
+    fi
+  done
+
+  (( best > 0 )) || return 1
+  for step in 0 8 16 32 64 96 128; do
+    candidate=$((best - step))
+    (( candidate >= min_mtu )) || candidate="$min_mtu"
+    if apply_resolved_target_mtu "$resolved" "$candidate" && probe_mtu_stable "$bind" "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+    (( candidate == min_mtu )) && break
+  done
+
+  return 1
 }
 
 probe_https_only() {
@@ -2158,7 +2302,7 @@ print_health_details() {
   if [[ -n "${HEALTH_MTU_REPAIR:-}" ]]; then
     printf '  已应用修复: mtu %s\n' "$HEALTH_MTU_REPAIR"
   elif [[ "${HEALTH_PING:-}" == OK && "${HEALTH_HTTPS:-}" == FAIL* ]]; then
-    printf '  建议: 小包可通但 HTTPS 失败，优先尝试 qh repair current 1280\n'
+    printf '  建议: 小包可通但 HTTPS 失败，优先尝试 qh repair current auto 自动探测最大稳定 MTU\n'
   fi
 }
 
@@ -2426,20 +2570,18 @@ auto_switch_best_target() {
 
 repair_route_mtu() {
   local token="${1:-current}"
-  local mtu="${2:-1280}"
-  local current resolved selector
+  local mtu="${2:-auto}"
+  local current resolved selector bind detected previous_line
 
   if [[ "${token,,}" == "list" ]]; then
     show_route_repairs
     return 0
   fi
 
-  validate_mtu "$mtu" || { log error "MTU 必须是 1280-9000 的整数"; return 1; }
-
   current="$(current_selector)"
   if [[ -z "$token" || "${token,,}" == "current" ]]; then
     if [[ "$current" == "none" || "$current" == "unknown" ]]; then
-      log error "当前线路无法识别，请显式指定线路，例如: qh repair jp-1 1280"
+      log error "当前线路无法识别，请显式指定线路，例如: qh repair jp-1 auto"
       return 1
     fi
     selector="$current"
@@ -2450,6 +2592,24 @@ repair_route_mtu() {
       return 1
     fi
     selector="$(resolved_selector_name "$resolved")"
+  fi
+
+  if [[ "${mtu,,}" == "auto" || -z "$mtu" ]]; then
+    bind="$(resolved_probe_bind "$resolved")"
+    previous_line="$(pick_best_default_route "$IFACE" || true)"
+    log info "正在探测 ${selector} 的最大稳定 MTU，范围 ${MTU_AUTO_MIN}-${MTU_AUTO_MAX:-接口MTU}，稳定阈值丢包 ≤ ${MTU_AUTO_MAX_LOSS_PERCENT}%..."
+    if ! detected="$(detect_max_stable_mtu "$resolved" "$bind")"; then
+      restore_previous_route_safely "$previous_line"
+      log error "自动 MTU 探测失败，未写入修复记录"
+      return 1
+    fi
+    mtu="$detected"
+    log success "最大稳定 MTU: ${mtu}"
+    if [[ "$current" != "$selector" ]]; then
+      restore_previous_route_safely "$previous_line"
+    fi
+  else
+    validate_mtu "$mtu" || { log error "MTU 必须是 1280-9000 的整数，或使用 auto 自动探测"; return 1; }
   fi
 
   save_route_mtu "$selector" "$mtu"
@@ -2642,7 +2802,7 @@ usage() {
   qh test                    检测当前线路 IPv6 连通性
   qh probe                   逐条检测全部线路 IPv6 连通性
   qh probe <目标>            检测指定线路 IPv6 连通性
-  qh repair [目标] [MTU]     为线路写入并应用路由 MTU 修复，默认 current 1280
+  qh repair [目标] [MTU|auto] 为线路写入并应用路由 MTU 修复，默认 current auto
   qh repair list             查看已保存的 MTU 修复记录
   qh priority list           查看优先级顺序
   qh priority set <目标> <优先级>
@@ -2663,8 +2823,8 @@ usage() {
   qh jp-2
   qh probe
   qh probe jp-2
-  qh repair current 1280
-  qh repair jp-2 1280
+  qh repair current auto
+  qh repair jp-2 auto
   qh priority list
   qh priority set jp-1 1
   qh priority wizard
@@ -2949,7 +3109,7 @@ menu_loop() {
     menu_line 5 "查看优先级顺序"
     menu_line 6 "优先级字母向导"
     menu_line 7 "自动守护 开启/关闭/状态"
-    menu_line 8 "修复当前线路 MTU（默认 1280）"
+    menu_line 8 "自动探测并修复当前线路 MTU"
     menu_line 9 "查看帮助"
     menu_line 10 "还原 DynamicV6 变更"
     menu_line 11 "卸载并删除 qh"
@@ -2999,7 +3159,7 @@ menu_loop() {
         pause_menu_return
         ;;
       8)
-        repair_route_mtu current 1280 || true
+        repair_route_mtu current auto || true
         pause_menu_return
         ;;
       9|-h|--help|help)
@@ -3097,7 +3257,7 @@ main() {
       probe_target "${ARGS[1]:-}" "${ARGS[2]:-}"
       ;;
     repair)
-      repair_route_mtu "${ARGS[1]:-current}" "${ARGS[2]:-1280}" "${ARGS[3]:-}"
+      repair_route_mtu "${ARGS[1]:-current}" "${ARGS[2]:-auto}" "${ARGS[3]:-}"
       ;;
     auto)
       handle_auto_command "${ARGS[1]:-run}"

@@ -11,7 +11,7 @@
 - 自动生成管理命令 `qh`
 - 支持当前线路检测与全部线路探测
 - 连通性检测同时覆盖 ICMPv6、HTTPS 与 MTU 探测，便于判断 PMTU 黑洞问题
-- 支持为指定线路保存并自动应用路由 `mtu` 修复，例如 `mtu 1280`
+- 支持为指定线路自动探测最大稳定路由 `mtu`，也可手动保存并自动应用指定值
 - 支持线路优先级排序
 - 支持按优先级自动切换到最佳可用线路
 - 支持 `systemd timer` / `cron` 定时巡检
@@ -67,17 +67,18 @@ qh jp-2                    # 按线路代号切换线路
 qh test
 ```
 
-如检测提示 ICMPv6 正常但 HTTPS 异常，可对当前线路写入并应用 `mtu 1280` 修复：
+如检测提示 ICMPv6 正常但 HTTPS 异常，可对当前线路自动探测最大稳定 MTU 并写入修复记录：
 
 ```bash
-qh repair current 1280
+qh repair current auto
 ```
 
-也可以对指定线路保存修复，后续切换到该线路时会自动带上 `mtu`：
+也可以对指定线路自动探测或手动保存修复，后续切换到该线路时会自动带上 `mtu`：
 
 ```bash
-qh repair jp-2 1280
-qh repair native 1280
+qh repair jp-2 auto
+qh repair native auto
+qh repair jp-2 1400      # 手动指定 MTU
 qh repair list
 ```
 
@@ -120,6 +121,10 @@ QH_IPV6_HTTPS_URL=https://ipv6.icanhazip.com # HTTPS 探测目标
 QH_IPV6_PROBE_COUNT=2                        # ping 次数
 QH_IPV6_PROBE_TIMEOUT=3                      # ping 超时秒数
 QH_IPV6_HTTP_TIMEOUT=10                      # HTTPS 超时秒数
+QH_IPV6_MTU_AUTO_MIN=1280                    # 自动探测 MTU 下限
+QH_IPV6_MTU_AUTO_MAX=1500                    # 自动探测 MTU 上限，默认使用网卡 MTU
+QH_IPV6_MTU_AUTO_PING_COUNT=20               # 稳定性验证 ping 次数
+QH_IPV6_MTU_AUTO_MAX_LOSS_PERCENT=5          # 稳定性验证允许的最大丢包百分比
 ```
 
 ## 注意事项
