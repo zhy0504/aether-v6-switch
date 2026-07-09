@@ -1445,12 +1445,57 @@ replace_default_route() {
   local metric="$3"
   local onlink="$4"
   local mtu="${5:-}"
+  local table=""
 
   local cmd=(ip -6 route replace default via "$via" dev "$IFACE")
   [[ -n "$src" ]] && cmd+=(src "$src")
   [[ -n "$metric" ]] && cmd+=(metric "$metric")
   [[ "$onlink" == "1" ]] && cmd+=(onlink)
   [[ -n "$mtu" ]] && cmd+=(mtu "$mtu")
+  "${cmd[@]}"
+
+  if [[ -n "$src" ]]; then
+    table="$(source_policy_table_for_src "$src" || true)"
+    if [[ -n "$table" ]]; then
+      replace_source_policy_route "$table" "$via" "$src" "$metric" "$onlink" "$mtu" || true
+    fi
+  fi
+}
+
+source_policy_table_for_src() {
+  local src="$1"
+  local src_no_prefix="${src%/*}"
+  local line rule_src table
+
+  while read -r line; do
+    rule_src="$(route_field "$line" "from")"
+    table="$(route_field "$line" "lookup")"
+    [[ -n "$rule_src" && -n "$table" ]] || continue
+    rule_src="${rule_src%/*}"
+    if ipv6_equal "$rule_src" "$src_no_prefix" 2>/dev/null; then
+      echo "$table"
+      return 0
+    fi
+  done < <(ip -6 rule show 2>/dev/null)
+}
+
+replace_source_policy_route() {
+  local table="$1"
+  local via="$2"
+  local src="$3"
+  local metric="$4"
+  local onlink="$5"
+  local mtu="${6:-}"
+  local cmd
+
+  [[ -n "$table" && -n "$via" && -n "$src" ]] || return 1
+  [[ "${via,,}" == fe80:* ]] || ip -6 route replace "${via}/128" dev "$IFACE" table "$table" >/dev/null 2>&1 || true
+
+  cmd=(ip -6 route replace default via "$via" dev "$IFACE" src "$src")
+  [[ -n "$metric" ]] && cmd+=(metric "$metric")
+  [[ "$onlink" == "1" ]] && cmd+=(onlink)
+  [[ -n "$mtu" ]] && cmd+=(mtu "$mtu")
+  cmd+=(table "$table")
   "${cmd[@]}"
 }
 
